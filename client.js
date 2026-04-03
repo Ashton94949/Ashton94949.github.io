@@ -1,5 +1,6 @@
 document.addEventListener("DOMContentLoaded", () => {
-    let socket = io("whiteboard-production-d685.up.railway.app", {
+    // FIX 1: Added https:// protocol to socket URL
+    let socket = io("https://whiteboard-production-d685.up.railway.app", {
   transports: ["websocket", "polling"]
 });
     let myUsername = ""; let myColor = ""; let currentChannel = "chat"; let pendingPassword = "";
@@ -73,6 +74,17 @@ document.addEventListener("DOMContentLoaded", () => {
     let canvasObjects = []; let isDrawing = false; let activeTool = "pen"; let colorPicked = "#ffffff"; let lineWidth = 5;
     let draggingObject = null; let isResizing = false; let dragOffsetX = 0; let dragOffsetY = 0; let currentDrawingObj = null;
 
+    // FIX 3: Image cache to prevent flicker on every drawCanvas() call
+    const imageCache = {};
+    function getCachedImage(src) {
+        if (imageCache[src]) return imageCache[src];
+        const img = new Image();
+        img.src = src;
+        img.onload = () => drawCanvas(); // Redraw once loaded
+        imageCache[src] = img;
+        return img;
+    }
+
     const tools = { select: document.getElementById("selectButton"), pen: document.getElementById("penButton"), line: document.getElementById("lineButton"), square: document.getElementById("squareButton"), circle: document.getElementById("circleButton"), text: document.getElementById("textButton") };
     function setTool(tool) { activeTool = tool; Object.values(tools).forEach(b => b.classList.remove("active")); tools[tool].classList.add("active"); }
     Object.keys(tools).forEach(t => tools[t].addEventListener("click", () => setTool(t)));
@@ -98,9 +110,9 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (obj.type === "circle") { ctx.beginPath(); let r = Math.hypot(obj.endX - obj.startX, obj.endY - obj.startY); ctx.arc(obj.startX, obj.startY, r, 0, Math.PI * 2); ctx.stroke();
             } else if (obj.type === "text") { ctx.font = `${obj.width * 5}px Arial`; ctx.fillText(obj.text, obj.startX, obj.startY);
             } else if (obj.type === "image") { 
-                let img = new Image(); img.src = obj.src; 
+                // FIX 3: Use cached image instead of new Image() every frame
+                let img = getCachedImage(obj.src);
                 ctx.drawImage(img, obj.startX, obj.startY, obj.width, obj.height); 
-                // Draw Resize Handle for images
                 if (activeTool === "select") {
                     ctx.fillStyle = "rgba(88, 101, 242, 0.8)";
                     ctx.fillRect(obj.startX + obj.width - 15, obj.startY + obj.height - 15, 15, 15);
@@ -113,9 +125,7 @@ document.addEventListener("DOMContentLoaded", () => {
         for (let i = canvasObjects.length - 1; i >= 0; i--) {
             let obj = canvasObjects[i];
             if (obj.type === "image") {
-                // Check if clicked the resize handle (bottom-right 20x20 area)
                 if (x >= obj.startX + obj.width - 20 && x <= obj.startX + obj.width + 10 && y >= obj.startY + obj.height - 20 && y <= obj.startY + obj.height + 10) return { obj: obj, action: "resize" };
-                // Otherwise normal drag
                 if (x >= obj.startX && x <= obj.startX + obj.width && y >= obj.startY && y <= obj.startY + obj.height) return { obj: obj, action: "drag" };
             }
             if (obj.type === "square" && x >= Math.min(obj.startX, obj.endX) && x <= Math.max(obj.startX, obj.endX) && y >= Math.min(obj.startY, obj.endY) && y <= Math.max(obj.startY, obj.endY)) return { obj: obj, action: "drag" };
@@ -137,8 +147,9 @@ document.addEventListener("DOMContentLoaded", () => {
                 draggingObject = clicked.obj; 
                 isResizing = clicked.action === "resize";
                 if(!isResizing) {
-                    dragOffsetX = pos.x - (draggingObject.startX || draggingObject.points[0].x); 
-                    dragOffsetY = pos.y - (draggingObject.startY || draggingObject.points[0].y); 
+                    // FIX 4: Store the initial pointer position, not derived from object coords
+                    dragOffsetX = pos.x - (draggingObject.startX !== undefined ? draggingObject.startX : draggingObject.points[0].x);
+                    dragOffsetY = pos.y - (draggingObject.startY !== undefined ? draggingObject.startY : draggingObject.points[0].y);
                 }
             }
         } else if (activeTool === "text") {
@@ -153,7 +164,8 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    document.addEventListener("mousemove", (e) => {
+    // FIX 2: Moved mousemove listener from document to canvas to avoid bad coordinates outside canvas
+    canvas.addEventListener("mousemove", (e) => {
         let pos = getMousePos(e);
         if (draggingObject && activeTool === "select") {
             if (isResizing && draggingObject.type === "image") {
@@ -162,10 +174,20 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (newWidth > 20) draggingObject.width = newWidth;
                 if (newHeight > 20) draggingObject.height = newHeight;
             } else {
-                let dx = pos.x - dragOffsetX - (draggingObject.startX || draggingObject.points[0].x); let dy = pos.y - dragOffsetY - (draggingObject.startY || draggingObject.points[0].y);
-                if (draggingObject.type === "pen" || draggingObject.type === "eraser") draggingObject.points.forEach(p => { p.x += dx; p.y += dy; });
-                else { draggingObject.startX += dx; draggingObject.startY += dy; if (draggingObject.endX) { draggingObject.endX += dx; draggingObject.endY += dy; } }
-                dragOffsetX = pos.x - (draggingObject.startX || draggingObject.points[0].x); dragOffsetY = pos.y - (draggingObject.startY || draggingObject.points[0].y);
+                // FIX 4: Use stable offset instead of recomputing from shifted points
+                let newStartX = pos.x - dragOffsetX;
+                let newStartY = pos.y - dragOffsetY;
+                let dx, dy;
+                if (draggingObject.type === "pen" || draggingObject.type === "eraser") {
+                    dx = newStartX - draggingObject.points[0].x;
+                    dy = newStartY - draggingObject.points[0].y;
+                    draggingObject.points.forEach(p => { p.x += dx; p.y += dy; });
+                } else {
+                    dx = newStartX - draggingObject.startX;
+                    dy = newStartY - draggingObject.startY;
+                    draggingObject.startX += dx; draggingObject.startY += dy;
+                    if (draggingObject.endX !== undefined) { draggingObject.endX += dx; draggingObject.endY += dy; }
+                }
             }
             drawCanvas(); socket.emit("canvasUpdate", draggingObject);
         } else if (isDrawing && currentDrawingObj) {
@@ -175,6 +197,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
+    // Keep mouseup on document so releasing outside canvas still stops drawing
     document.addEventListener("mouseup", () => { if (isDrawing && currentDrawingObj) { isDrawing = false; currentDrawingObj = null; } if (draggingObject) draggingObject = null; isResizing = false;});
 
     document.addEventListener("paste", (e) => {
@@ -483,10 +506,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 if (state.players) {
                     state.players.forEach((p, idx) => {
                         let wrapper = document.createElement("div"); wrapper.style.background = "var(--bg-primary)"; wrapper.style.padding = "10px"; wrapper.style.borderRadius = "8px"; wrapper.style.textAlign = "center";
-
-                        // Highlight if waiting on this player
                         if(state.state === "playing" && p.status === "playing") wrapper.style.border = "2px solid #f1c40f";
-
                         let title = document.createElement("h4"); title.style.color = "white"; title.textContent = `${p.name} ${p.result ? `(${p.result})` : ''}`;
                         let handDiv = document.createElement("div"); handDiv.className = "card-area";
                         if (p.hand) {
